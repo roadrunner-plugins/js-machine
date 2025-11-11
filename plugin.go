@@ -25,6 +25,9 @@ type Plugin struct {
 	vmPoolSize int
 	mu         sync.RWMutex
 
+	// Go bindings for JavaScript
+	bindings *Bindings
+
 	// Graceful shutdown
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -77,6 +80,9 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 	// Initialize metrics
 	p.initMetrics()
 
+	// Initialize bindings
+	p.bindings = newBindings(p.log, p)
+
 	p.log.Info("JavaScript plugin initialized",
 		zap.Int("pool_size", p.cfg.PoolSize),
 		zap.Int("max_memory_mb", p.cfg.MaxMemoryMB),
@@ -105,6 +111,13 @@ func (p *Plugin) Serve() chan error {
 
 		// Set up interrupt channel for timeout handling
 		vm.Interrupt = make(chan func(), 1)
+
+		// Inject Go bindings into VM
+		if err := p.bindings.injectIntoVM(vm); err != nil {
+			p.log.Error("failed to inject bindings into VM", zap.Error(err))
+			errCh <- fmt.Errorf("failed to inject bindings: %w", err)
+			return errCh
+		}
 
 		p.vmPool <- vm
 	}
