@@ -219,21 +219,7 @@ func (p *Plugin) execute(ctx context.Context, script string, timeout time.Durati
 	resultCh := make(chan otto.Value, 1)
 	errCh := make(chan error, 1)
 
-	// Watchdog for timeout
-	watchdogDone := make(chan struct{})
-	defer close(watchdogDone)
-
-	go func() {
-		select {
-		case <-execCtx.Done():
-			vm.Interrupt <- func() {
-				panic("execution timeout")
-			}
-		case <-watchdogDone:
-		}
-	}()
-
-	// Execute JavaScript
+	// Execute JavaScript in goroutine
 	go func() {
 		defer func() {
 			if caught := recover(); caught != nil {
@@ -247,6 +233,17 @@ func (p *Plugin) execute(ctx context.Context, script string, timeout time.Durati
 			return
 		}
 		resultCh <- value
+	}()
+
+	// Timeout watchdog - only interrupt if context times out
+	go func() {
+		<-execCtx.Done()
+		if execCtx.Err() == context.DeadlineExceeded {
+			// Only interrupt on actual timeout, not cancellation
+			vm.Interrupt <- func() {
+				panic("execution timeout")
+			}
+		}
 	}()
 
 	// Wait for result or timeout
