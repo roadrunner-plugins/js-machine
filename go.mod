@@ -1,4 +1,4 @@
-module github.com/roadrunner-server/js-machine
+module github.com/roadrunner-plugins/js-machine
 
 go 1.23
 

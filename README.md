@@ -14,7 +14,7 @@ JavaScript interpreter.
 ## Installation
 
 ```bash
-go get github.com/roadrunner-server/js-machine
+go get github.com/roadrunner-plugins/js-machine
 ```
 
 ## Configuration
@@ -38,9 +38,9 @@ Executes JavaScript code and returns the result.
 
 ```go
 type ExecuteRequest struct {
-    Code       string `json:"code"`       // JavaScript code to execute
-    TimeoutMs  int    `json:"timeout_ms"` // Execution timeout (optional)
-    RequestID  string `json:"request_id,omitempty"` // Request correlation ID
+Code       string `json:"code"`       // JavaScript code to execute
+TimeoutMs  int    `json:"timeout_ms"` // Execution timeout (optional)
+RequestID  string `json:"request_id,omitempty"` // Request correlation ID
 }
 ```
 
@@ -48,10 +48,10 @@ type ExecuteRequest struct {
 
 ```go
 type ExecuteResponse struct {
-    Result     interface{} `json:"result"`          // Execution result
-    DurationMs int64       `json:"duration_ms"`     // Execution time
-    Error      string      `json:"error,omitempty"` // Error message if failed
-    RequestID  string      `json:"request_id,omitempty"` // Request correlation ID
+Result     interface{} `json:"result"`          // Execution result
+DurationMs int64       `json:"duration_ms"`     // Execution time
+Error      string      `json:"error,omitempty"` // Error message if failed
+RequestID  string      `json:"request_id,omitempty"` // Request correlation ID
 }
 ```
 
@@ -367,6 +367,7 @@ js:
 **Metrics**: Check `js_executions_total{status="error"}`
 
 **Investigation**:
+
 - Review error logs
 - Verify JavaScript syntax
 - Check timeout configuration
@@ -378,6 +379,7 @@ js:
 **Metrics**: Monitor `js_execution_duration_seconds` percentiles
 
 **Investigation**:
+
 - Check `js_code_size_bytes` for large scripts
 - Review `js_active_executions` for high concurrency
 - Verify no resource contention
@@ -404,6 +406,7 @@ js:
 Access metrics at `http://localhost:2112/metrics`
 
 Key metrics:
+
 - `js_executions_total` - Total executions by status
 - `js_execution_duration_seconds` - Latency distribution
 - `js_pool_available` - Available VMs
