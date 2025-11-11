@@ -155,23 +155,23 @@ func (l *LogBinding) getFields(call otto.FunctionCall) []zap.Field {
 }
 
 // MetricsBinding provides metrics functions to JavaScript
+// Following the RoadRunner metrics plugin pattern: JavaScript can only manipulate
+// pre-registered metrics from plugin configuration, not create new ones at runtime.
+// This design prevents metric cardinality explosion and aligns with RoadRunner's
+// static metric registration philosophy.
 type MetricsBinding struct {
 	plugin *Plugin
-	mu     sync.RWMutex
 
-	// User-defined metrics registry
-	userCounters   map[string]*prometheus.CounterVec
-	userGauges     map[string]*prometheus.GaugeVec
-	userHistograms map[string]*prometheus.HistogramVec
+	// Pre-registered user metrics from plugin configuration
+	// These are registered during plugin Init() via MetricsCollector()
+	// JavaScript code can only manipulate these existing metrics
+	userMetrics sync.Map // map[string]prometheus.Collector
 }
 
 // newMetricsBinding creates a new metrics binding
 func newMetricsBinding(plugin *Plugin) *MetricsBinding {
 	return &MetricsBinding{
-		plugin:         plugin,
-		userCounters:   make(map[string]*prometheus.CounterVec),
-		userGauges:     make(map[string]*prometheus.GaugeVec),
-		userHistograms: make(map[string]*prometheus.HistogramVec),
+		plugin: plugin,
 	}
 }
 
@@ -182,45 +182,26 @@ func (m *MetricsBinding) inject(vm *otto.Otto) error {
 		return err
 	}
 
-	// metrics.increment(name, labels)
-	if err := metricsObj.Set("increment", m.increment); err != nil {
+	// metrics.add(name, value, labels) - for counters and gauges
+	if err := metricsObj.Set("add", m.add); err != nil {
 		return err
 	}
 
-	// metrics.gauge(name, value, labels)
-	if err := metricsObj.Set("gauge", m.gauge); err != nil {
+	// metrics.set(name, value, labels) - for gauges only
+	if err := metricsObj.Set("set", m.set); err != nil {
 		return err
 	}
 
-	// metrics.histogram(name, value, labels)
-	if err := metricsObj.Set("histogram", m.histogram); err != nil {
+	// metrics.observe(name, value, labels) - for histograms
+	if err := metricsObj.Set("observe", m.observe); err != nil {
 		return err
 	}
 
 	return vm.Set("metrics", metricsObj)
 }
 
-// increment increments a counter metric
-func (m *MetricsBinding) increment(call otto.FunctionCall) otto.Value {
-	if len(call.ArgumentList) == 0 {
-		return otto.UndefinedValue()
-	}
-
-	name := call.Argument(0).String()
-	labels := m.extractLabels(call, 1)
-
-	// Get or create counter
-	counter := m.getOrCreateCounter(name, labels)
-	if counter == nil {
-		return otto.UndefinedValue()
-	}
-
-	counter.With(labels).Inc()
-	return otto.UndefinedValue()
-}
-
-// gauge sets a gauge metric
-func (m *MetricsBinding) gauge(call otto.FunctionCall) otto.Value {
+// add adds value to a counter or gauge (follows metrics plugin RPC pattern)
+func (m *MetricsBinding) add(call otto.FunctionCall) otto.Value {
 	if len(call.ArgumentList) < 2 {
 		return otto.UndefinedValue()
 	}
@@ -231,20 +212,68 @@ func (m *MetricsBinding) gauge(call otto.FunctionCall) otto.Value {
 		return otto.UndefinedValue()
 	}
 
-	labels := m.extractLabels(call, 2)
+	// Extract labels if provided
+	var labelValues []string
+	if len(call.ArgumentList) > 2 {
+		labelValues = m.extractLabelValues(call, 2)
+	}
 
-	// Get or create gauge
-	gauge := m.getOrCreateGauge(name, labels)
-	if gauge == nil {
+	// Find pre-registered metric
+	collector, exists := m.userMetrics.Load(name)
+	if !exists {
+		m.plugin.log.Warn("metric not found, must be declared in config first",
+			zap.String("name", name))
 		return otto.UndefinedValue()
 	}
 
-	gauge.With(labels).Set(value)
+	// Handle different collector types (following metrics plugin rpc.go pattern)
+	switch c := collector.(type) {
+	case prometheus.Counter:
+		c.Add(value)
+
+	case *prometheus.CounterVec:
+		if len(labelValues) == 0 {
+			m.plugin.log.Warn("labels required for vector metric",
+				zap.String("name", name))
+			return otto.UndefinedValue()
+		}
+		counter, err := c.GetMetricWithLabelValues(labelValues...)
+		if err != nil {
+			m.plugin.log.Error("failed to get metric with labels",
+				zap.String("name", name),
+				zap.Error(err))
+			return otto.UndefinedValue()
+		}
+		counter.Add(value)
+
+	case prometheus.Gauge:
+		c.Add(value)
+
+	case *prometheus.GaugeVec:
+		if len(labelValues) == 0 {
+			m.plugin.log.Warn("labels required for vector metric",
+				zap.String("name", name))
+			return otto.UndefinedValue()
+		}
+		gauge, err := c.GetMetricWithLabelValues(labelValues...)
+		if err != nil {
+			m.plugin.log.Error("failed to get metric with labels",
+				zap.String("name", name),
+				zap.Error(err))
+			return otto.UndefinedValue()
+		}
+		gauge.Add(value)
+
+	default:
+		m.plugin.log.Warn("metric does not support add operation",
+			zap.String("name", name))
+	}
+
 	return otto.UndefinedValue()
 }
 
-// histogram observes a value in a histogram metric
-func (m *MetricsBinding) histogram(call otto.FunctionCall) otto.Value {
+// set sets a gauge value (follows metrics plugin RPC pattern)
+func (m *MetricsBinding) set(call otto.FunctionCall) otto.Value {
 	if len(call.ArgumentList) < 2 {
 		return otto.UndefinedValue()
 	}
@@ -255,194 +284,158 @@ func (m *MetricsBinding) histogram(call otto.FunctionCall) otto.Value {
 		return otto.UndefinedValue()
 	}
 
-	labels := m.extractLabels(call, 2)
+	// Extract labels if provided
+	var labelValues []string
+	if len(call.ArgumentList) > 2 {
+		labelValues = m.extractLabelValues(call, 2)
+	}
 
-	// Get or create histogram
-	histogram := m.getOrCreateHistogram(name, labels)
-	if histogram == nil {
+	// Find pre-registered metric
+	collector, exists := m.userMetrics.Load(name)
+	if !exists {
+		m.plugin.log.Warn("metric not found, must be declared in config first",
+			zap.String("name", name))
 		return otto.UndefinedValue()
 	}
 
-	histogram.With(labels).Observe(value)
+	// Handle different gauge types (following metrics plugin rpc.go pattern)
+	switch c := collector.(type) {
+	case prometheus.Gauge:
+		c.Set(value)
+
+	case *prometheus.GaugeVec:
+		if len(labelValues) == 0 {
+			m.plugin.log.Warn("labels required for vector metric",
+				zap.String("name", name))
+			return otto.UndefinedValue()
+		}
+		gauge, err := c.GetMetricWithLabelValues(labelValues...)
+		if err != nil {
+			m.plugin.log.Error("failed to get metric with labels",
+				zap.String("name", name),
+				zap.Error(err))
+			return otto.UndefinedValue()
+		}
+		gauge.Set(value)
+
+	default:
+		m.plugin.log.Warn("metric does not support set operation (only gauges)",
+			zap.String("name", name))
+	}
+
 	return otto.UndefinedValue()
 }
 
-// extractLabels extracts labels from the function call
-func (m *MetricsBinding) extractLabels(call otto.FunctionCall, argIndex int) prometheus.Labels {
+// observe records a histogram observation (follows metrics plugin RPC pattern)
+func (m *MetricsBinding) observe(call otto.FunctionCall) otto.Value {
+	if len(call.ArgumentList) < 2 {
+		return otto.UndefinedValue()
+	}
+
+	name := call.Argument(0).String()
+	value, err := call.Argument(1).ToFloat()
+	if err != nil {
+		return otto.UndefinedValue()
+	}
+
+	// Extract labels if provided
+	var labelValues []string
+	if len(call.ArgumentList) > 2 {
+		labelValues = m.extractLabelValues(call, 2)
+	}
+
+	// Find pre-registered metric
+	collector, exists := m.userMetrics.Load(name)
+	if !exists {
+		m.plugin.log.Warn("metric not found, must be declared in config first",
+			zap.String("name", name))
+		return otto.UndefinedValue()
+	}
+
+	// Handle different histogram types (following metrics plugin rpc.go pattern)
+	switch c := collector.(type) {
+	case prometheus.Histogram:
+		c.Observe(value)
+
+	case *prometheus.HistogramVec:
+		if len(labelValues) == 0 {
+			m.plugin.log.Warn("labels required for vector metric",
+				zap.String("name", name))
+			return otto.UndefinedValue()
+		}
+		observer, err := c.GetMetricWithLabelValues(labelValues...)
+		if err != nil {
+			m.plugin.log.Error("failed to get metric with labels",
+				zap.String("name", name),
+				zap.Error(err))
+			return otto.UndefinedValue()
+		}
+		observer.Observe(value)
+
+	default:
+		m.plugin.log.Warn("metric does not support observe operation (only histograms)",
+			zap.String("name", name))
+	}
+
+	return otto.UndefinedValue()
+}
+
+// extractLabelValues extracts label values as string slice (for GetMetricWithLabelValues)
+// This accepts either an array of label values or an object with label key-value pairs
+func (m *MetricsBinding) extractLabelValues(call otto.FunctionCall, argIndex int) []string {
 	if len(call.ArgumentList) <= argIndex {
-		return prometheus.Labels{}
+		return nil
 	}
 
 	labelsValue := call.Argument(argIndex)
-	if !labelsValue.IsObject() {
-		return prometheus.Labels{}
-	}
 
-	labelsObj := labelsValue.Object()
-	keys := labelsObj.Keys()
-
-	labels := make(prometheus.Labels, len(keys))
-	for _, key := range keys {
-		value, err := labelsObj.Get(key)
+	// Handle array of label values: ["value1", "value2"]
+	if labelsValue.Class() == "Array" {
+		length, err := labelsValue.Object().Get("length")
 		if err != nil {
-			continue
+			return nil
 		}
-		labels[key] = value.String()
+
+		lengthInt, err := length.ToInteger()
+		if err != nil {
+			return nil
+		}
+
+		values := make([]string, lengthInt)
+		for i := int64(0); i < lengthInt; i++ {
+			item, err := labelsValue.Object().Get(fmt.Sprintf("%d", i))
+			if err != nil {
+				continue
+			}
+			values[i] = item.String()
+		}
+		return values
 	}
 
-	return labels
+	// Handle object with label key-value pairs: {method: "GET", status: "200"}
+	if labelsValue.IsObject() {
+		labelsObj := labelsValue.Object()
+		keys := labelsObj.Keys()
+
+		values := make([]string, len(keys))
+		for i, key := range keys {
+			value, err := labelsObj.Get(key)
+			if err != nil {
+				continue
+			}
+			values[i] = value.String()
+		}
+		return values
+	}
+
+	return nil
 }
 
-// getOrCreateCounter gets or creates a counter metric
-func (m *MetricsBinding) getOrCreateCounter(name string, labels prometheus.Labels) *prometheus.CounterVec {
-	m.mu.RLock()
-	// Check if counter already exists
-	if counter, exists := m.userCounters[name]; exists {
-		m.mu.RUnlock()
-		return counter
-	}
-	m.mu.RUnlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if counter, exists := m.userCounters[name]; exists {
-		return counter
-	}
-
-	// Create label names slice
-	labelNames := make([]string, 0, len(labels))
-	for key := range labels {
-		labelNames = append(labelNames, key)
-	}
-
-	// Create new counter
-	counter := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "js_user",
-			Name:      name,
-			Help:      fmt.Sprintf("User-defined counter: %s", name),
-		},
-		labelNames,
-	)
-
-	// Register with Prometheus - MUST use Register, not via MetricsCollector
-	if err := prometheus.Register(counter); err != nil {
-		// If already registered by another VM, try to get it
-		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
-			if existing, ok := are.ExistingCollector.(*prometheus.CounterVec); ok {
-				m.userCounters[name] = existing
-				return existing
-			}
-		}
-		m.plugin.log.Error("failed to register counter", zap.String("name", name), zap.Error(err))
-		return nil
-	}
-
-	m.userCounters[name] = counter
-	return counter
-}
-
-// getOrCreateGauge gets or creates a gauge metric
-func (m *MetricsBinding) getOrCreateGauge(name string, labels prometheus.Labels) *prometheus.GaugeVec {
-	m.mu.RLock()
-	// Check if gauge already exists
-	if gauge, exists := m.userGauges[name]; exists {
-		m.mu.RUnlock()
-		return gauge
-	}
-	m.mu.RUnlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if gauge, exists := m.userGauges[name]; exists {
-		return gauge
-	}
-
-	// Create label names slice
-	labelNames := make([]string, 0, len(labels))
-	for key := range labels {
-		labelNames = append(labelNames, key)
-	}
-
-	// Create new gauge
-	gauge := prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "js_user",
-			Name:      name,
-			Help:      fmt.Sprintf("User-defined gauge: %s", name),
-		},
-		labelNames,
-	)
-
-	// Register with Prometheus - MUST use Register, not via MetricsCollector
-	if err := prometheus.Register(gauge); err != nil {
-		// If already registered by another VM, try to get it
-		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
-			if existing, ok := are.ExistingCollector.(*prometheus.GaugeVec); ok {
-				m.userGauges[name] = existing
-				return existing
-			}
-		}
-		m.plugin.log.Error("failed to register gauge", zap.String("name", name), zap.Error(err))
-		return nil
-	}
-
-	m.userGauges[name] = gauge
-	return gauge
-}
-
-// getOrCreateHistogram gets or creates a histogram metric
-func (m *MetricsBinding) getOrCreateHistogram(name string, labels prometheus.Labels) *prometheus.HistogramVec {
-	m.mu.RLock()
-	// Check if histogram already exists
-	if histogram, exists := m.userHistograms[name]; exists {
-		m.mu.RUnlock()
-		return histogram
-	}
-	m.mu.RUnlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if histogram, exists := m.userHistograms[name]; exists {
-		return histogram
-	}
-
-	// Create label names slice
-	labelNames := make([]string, 0, len(labels))
-	for key := range labels {
-		labelNames = append(labelNames, key)
-	}
-
-	// Create new histogram with sensible default buckets
-	histogram := prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: "js_user",
-			Name:      name,
-			Help:      fmt.Sprintf("User-defined histogram: %s", name),
-			Buckets:   []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
-		},
-		labelNames,
-	)
-
-	// Register with Prometheus - MUST use Register, not via MetricsCollector
-	if err := prometheus.Register(histogram); err != nil {
-		// If already registered by another VM, try to get it
-		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
-			if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
-				m.userHistograms[name] = existing
-				return existing
-			}
-		}
-		m.plugin.log.Error("failed to register histogram", zap.String("name", name), zap.Error(err))
-		return nil
-	}
-
-	m.userHistograms[name] = histogram
-	return histogram
+// registerUserMetric registers a user-defined metric for JavaScript access
+// This should be called during plugin initialization with metrics from config
+// Metrics MUST be registered via MetricsCollector() interface, not dynamically
+func (m *MetricsBinding) registerUserMetric(name string, collector prometheus.Collector) {
+	m.userMetrics.Store(name, collector)
+	m.plugin.log.Debug("registered user metric for JS access",
+		zap.String("name", name))
 }
