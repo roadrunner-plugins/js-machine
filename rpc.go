@@ -63,9 +63,10 @@ func (r *rpc) Execute(req *ExecuteRequest, resp *ExecuteResponse) error {
 		zap.Duration("timeout", timeout),
 	)
 
-	// Execute JavaScript
-	result, err := r.plugin.execute(nil, req.Code, timeout)
-	
+	// Execute JavaScript with background context
+	ctx := context.Background()
+	result, err := r.plugin.execute(ctx, req.Code, timeout)
+
 	duration := time.Since(start)
 	resp.DurationMs = duration.Milliseconds()
 	resp.RequestID = req.RequestID

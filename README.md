@@ -28,6 +28,8 @@ js:
   default_timeout_ms: 30000 # Default execution timeout in ms (default: 30000)
 ```
 
+**Note**: Configuration is optional. If not specified, the plugin will use default values.
+
 ## RPC Interface
 
 ### Execute Method

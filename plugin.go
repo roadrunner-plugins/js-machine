@@ -53,18 +53,17 @@ type Logger interface {
 func (p *Plugin) Init(cfg Configurer, log Logger) error {
 	const op = "js_plugin_init"
 
-	// Check if plugin is configured
-	if !cfg.Has(PluginName) {
-		return fmt.Errorf("%s: plugin not configured", op)
-	}
-
-	// Initialize configuration
+	// Initialize configuration with defaults
 	p.cfg = &Config{}
-	if err := cfg.UnmarshalKey(PluginName, p.cfg); err != nil {
-		return fmt.Errorf("%s: failed to unmarshal config: %w", op, err)
+
+	// Try to unmarshal config if it exists
+	if cfg.Has(PluginName) {
+		if err := cfg.UnmarshalKey(PluginName, p.cfg); err != nil {
+			return fmt.Errorf("%s: failed to unmarshal config: %w", op, err)
+		}
 	}
 
-	// Set defaults
+	// Always set defaults (fills in missing values)
 	p.cfg.InitDefaults()
 
 	// Validate configuration
@@ -193,6 +192,11 @@ func (p *Plugin) execute(ctx context.Context, script string, timeout time.Durati
 	// Track active executions
 	p.activeExecutions.Inc()
 	defer p.activeExecutions.Dec()
+
+	// Ensure we have a valid context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	// Acquire VM from pool
 	p.poolAvailable.Dec()
