@@ -155,17 +155,15 @@ func (l *LogBinding) getFields(call otto.FunctionCall) []zap.Field {
 }
 
 // MetricsBinding provides metrics functions to JavaScript
-// Following the RoadRunner metrics plugin pattern: JavaScript can only manipulate
-// pre-registered metrics from plugin configuration, not create new ones at runtime.
-// This design prevents metric cardinality explosion and aligns with RoadRunner's
-// static metric registration philosophy.
+// Following the metrics plugin pattern: metrics must be pre-registered via metrics plugin
+// JavaScript code can only manipulate existing metrics through the metrics plugin's collectors sync.Map
 type MetricsBinding struct {
 	plugin *Plugin
+	mu     sync.RWMutex
 
-	// Pre-registered user metrics from plugin configuration
-	// These are registered during plugin Init() via MetricsCollector()
-	// JavaScript code can only manipulate these existing metrics
-	userMetrics sync.Map // map[string]prometheus.Collector
+	// Cache of collectors loaded from metrics plugin
+	// These are fetched from the metrics plugin's collectors sync.Map
+	cachedCollectors sync.Map // map[string]prometheus.Collector
 }
 
 // newMetricsBinding creates a new metrics binding
@@ -200,7 +198,37 @@ func (m *MetricsBinding) inject(vm *otto.Otto) error {
 	return vm.Set("metrics", metricsObj)
 }
 
-// add adds value to a counter or gauge (follows metrics plugin RPC pattern)
+// getCollector retrieves a collector from the metrics plugin
+// This follows the same pattern as metrics plugin's rpc.go: c, exist := r.p.collectors.Load(m.Name)
+func (m *MetricsBinding) getCollector(name string) (prometheus.Collector, bool) {
+	// Check cache first
+	if cached, exists := m.cachedCollectors.Load(name); exists {
+		return cached.(prometheus.Collector), true
+	}
+
+	// Get from metrics plugin
+	if m.plugin.metricsPlugin == nil {
+		m.plugin.log.Warn("metrics plugin not available", zap.String("metric", name))
+		return nil, false
+	}
+
+	// Load from metrics plugin's collectors sync.Map
+	collector, exists := m.plugin.metricsPlugin.collectors.Load(name)
+	if !exists {
+		return nil, false
+	}
+
+	// Extract the actual collector from the wrapper
+	col := collector.(*metricsCollector)
+	actualCollector := col.col
+
+	// Cache it for future use
+	m.cachedCollectors.Store(name, actualCollector)
+
+	return actualCollector, true
+}
+
+// add adds value to a counter or gauge (follows metrics plugin rpc.go pattern)
 func (m *MetricsBinding) add(call otto.FunctionCall) otto.Value {
 	if len(call.ArgumentList) < 2 {
 		return otto.UndefinedValue()
@@ -218,22 +246,22 @@ func (m *MetricsBinding) add(call otto.FunctionCall) otto.Value {
 		labelValues = m.extractLabelValues(call, 2)
 	}
 
-	// Find pre-registered metric
-	collector, exists := m.userMetrics.Load(name)
+	// Get collector from metrics plugin (same pattern as rpc.go)
+	collector, exists := m.getCollector(name)
 	if !exists {
-		m.plugin.log.Warn("metric not found, must be declared in config first",
+		m.plugin.log.Warn("metric not found in metrics plugin",
 			zap.String("name", name))
 		return otto.UndefinedValue()
 	}
 
-	// Handle different collector types (following metrics plugin rpc.go pattern)
+	// Handle different collector types (exact pattern from metrics plugin rpc.go)
 	switch c := collector.(type) {
 	case prometheus.Counter:
 		c.Add(value)
 
 	case *prometheus.CounterVec:
 		if len(labelValues) == 0 {
-			m.plugin.log.Warn("labels required for vector metric",
+			m.plugin.log.Warn("required labels for collector",
 				zap.String("name", name))
 			return otto.UndefinedValue()
 		}
@@ -241,6 +269,7 @@ func (m *MetricsBinding) add(call otto.FunctionCall) otto.Value {
 		if err != nil {
 			m.plugin.log.Error("failed to get metric with labels",
 				zap.String("name", name),
+				zap.Strings("labels", labelValues),
 				zap.Error(err))
 			return otto.UndefinedValue()
 		}
@@ -251,7 +280,7 @@ func (m *MetricsBinding) add(call otto.FunctionCall) otto.Value {
 
 	case *prometheus.GaugeVec:
 		if len(labelValues) == 0 {
-			m.plugin.log.Warn("labels required for vector metric",
+			m.plugin.log.Warn("required labels for collector",
 				zap.String("name", name))
 			return otto.UndefinedValue()
 		}
@@ -259,20 +288,21 @@ func (m *MetricsBinding) add(call otto.FunctionCall) otto.Value {
 		if err != nil {
 			m.plugin.log.Error("failed to get metric with labels",
 				zap.String("name", name),
+				zap.Strings("labels", labelValues),
 				zap.Error(err))
 			return otto.UndefinedValue()
 		}
 		gauge.Add(value)
 
 	default:
-		m.plugin.log.Warn("metric does not support add operation",
+		m.plugin.log.Warn("collector does not support add operation",
 			zap.String("name", name))
 	}
 
 	return otto.UndefinedValue()
 }
 
-// set sets a gauge value (follows metrics plugin RPC pattern)
+// set sets a gauge value (follows metrics plugin rpc.go pattern)
 func (m *MetricsBinding) set(call otto.FunctionCall) otto.Value {
 	if len(call.ArgumentList) < 2 {
 		return otto.UndefinedValue()
@@ -290,22 +320,22 @@ func (m *MetricsBinding) set(call otto.FunctionCall) otto.Value {
 		labelValues = m.extractLabelValues(call, 2)
 	}
 
-	// Find pre-registered metric
-	collector, exists := m.userMetrics.Load(name)
+	// Get collector from metrics plugin
+	collector, exists := m.getCollector(name)
 	if !exists {
-		m.plugin.log.Warn("metric not found, must be declared in config first",
+		m.plugin.log.Warn("metric not found in metrics plugin",
 			zap.String("name", name))
 		return otto.UndefinedValue()
 	}
 
-	// Handle different gauge types (following metrics plugin rpc.go pattern)
+	// Handle different gauge types (exact pattern from metrics plugin rpc.go)
 	switch c := collector.(type) {
 	case prometheus.Gauge:
 		c.Set(value)
 
 	case *prometheus.GaugeVec:
 		if len(labelValues) == 0 {
-			m.plugin.log.Warn("labels required for vector metric",
+			m.plugin.log.Warn("required labels for collector",
 				zap.String("name", name))
 			return otto.UndefinedValue()
 		}
@@ -313,20 +343,21 @@ func (m *MetricsBinding) set(call otto.FunctionCall) otto.Value {
 		if err != nil {
 			m.plugin.log.Error("failed to get metric with labels",
 				zap.String("name", name),
+				zap.Strings("labels", labelValues),
 				zap.Error(err))
 			return otto.UndefinedValue()
 		}
 		gauge.Set(value)
 
 	default:
-		m.plugin.log.Warn("metric does not support set operation (only gauges)",
+		m.plugin.log.Warn("collector does not support set operation (only gauges)",
 			zap.String("name", name))
 	}
 
 	return otto.UndefinedValue()
 }
 
-// observe records a histogram observation (follows metrics plugin RPC pattern)
+// observe records a histogram observation (follows metrics plugin rpc.go pattern)
 func (m *MetricsBinding) observe(call otto.FunctionCall) otto.Value {
 	if len(call.ArgumentList) < 2 {
 		return otto.UndefinedValue()
@@ -344,22 +375,22 @@ func (m *MetricsBinding) observe(call otto.FunctionCall) otto.Value {
 		labelValues = m.extractLabelValues(call, 2)
 	}
 
-	// Find pre-registered metric
-	collector, exists := m.userMetrics.Load(name)
+	// Get collector from metrics plugin
+	collector, exists := m.getCollector(name)
 	if !exists {
-		m.plugin.log.Warn("metric not found, must be declared in config first",
+		m.plugin.log.Warn("metric not found in metrics plugin",
 			zap.String("name", name))
 		return otto.UndefinedValue()
 	}
 
-	// Handle different histogram types (following metrics plugin rpc.go pattern)
+	// Handle different histogram types (exact pattern from metrics plugin rpc.go)
 	switch c := collector.(type) {
 	case prometheus.Histogram:
 		c.Observe(value)
 
 	case *prometheus.HistogramVec:
 		if len(labelValues) == 0 {
-			m.plugin.log.Warn("labels required for vector metric",
+			m.plugin.log.Warn("required labels for collector",
 				zap.String("name", name))
 			return otto.UndefinedValue()
 		}
@@ -367,13 +398,14 @@ func (m *MetricsBinding) observe(call otto.FunctionCall) otto.Value {
 		if err != nil {
 			m.plugin.log.Error("failed to get metric with labels",
 				zap.String("name", name),
+				zap.Strings("labels", labelValues),
 				zap.Error(err))
 			return otto.UndefinedValue()
 		}
 		observer.Observe(value)
 
 	default:
-		m.plugin.log.Warn("metric does not support observe operation (only histograms)",
+		m.plugin.log.Warn("collector does not support observe operation (only histograms)",
 			zap.String("name", name))
 	}
 
@@ -413,6 +445,7 @@ func (m *MetricsBinding) extractLabelValues(call otto.FunctionCall, argIndex int
 	}
 
 	// Handle object with label key-value pairs: {method: "GET", status: "200"}
+	// Convert to array of values (order matters for GetMetricWithLabelValues!)
 	if labelsValue.IsObject() {
 		labelsObj := labelsValue.Object()
 		keys := labelsObj.Keys()
@@ -431,11 +464,9 @@ func (m *MetricsBinding) extractLabelValues(call otto.FunctionCall, argIndex int
 	return nil
 }
 
-// registerUserMetric registers a user-defined metric for JavaScript access
-// This should be called during plugin initialization with metrics from config
-// Metrics MUST be registered via MetricsCollector() interface, not dynamically
-func (m *MetricsBinding) registerUserMetric(name string, collector prometheus.Collector) {
-	m.userMetrics.Store(name, collector)
-	m.plugin.log.Debug("registered user metric for JS access",
-		zap.String("name", name))
+// metricsCollector is the internal collector wrapper used by metrics plugin
+// This mirrors the structure in metrics/plugin.go
+type metricsCollector struct {
+	col        prometheus.Collector
+	registered bool
 }

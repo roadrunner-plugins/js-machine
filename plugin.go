@@ -15,6 +15,16 @@ const (
 	PluginName = "js"
 )
 
+// MetricsPlugin interface for accessing metrics plugin's collectors
+type MetricsPlugin interface {
+	Name() string
+}
+
+// metricsPluginInternal provides access to metrics plugin's internal collectors sync.Map
+type metricsPluginInternal struct {
+	collectors sync.Map // name -> *collector
+}
+
 // Plugin represents the JavaScript execution plugin
 type Plugin struct {
 	log *zap.Logger
@@ -39,6 +49,9 @@ type Plugin struct {
 	poolAvailable     prometheus.Gauge
 	activeExecutions  prometheus.Gauge
 	codeSize          prometheus.Histogram
+
+	// Metrics plugin reference (for accessing user-defined metrics)
+	metricsPlugin *metricsPluginInternal
 }
 
 // Configurer interface for configuration access
@@ -162,6 +175,32 @@ func (p *Plugin) RPC() interface{} {
 	return &rpc{
 		plugin: p,
 		log:    p.log,
+	}
+}
+
+// Collects declares plugin dependencies - collects metrics plugin if available
+func (p *Plugin) Collects() []interface{} {
+	return []interface{}{
+		// Collect metrics plugin (optional dependency)
+		// This allows JavaScript to manipulate metrics registered in the metrics plugin
+		func(plugin interface{}) {
+			// Type assert to get access to the metrics plugin
+			// We need access to its internal collectors sync.Map
+			if mp, ok := plugin.(interface{ Name() string }); ok {
+				if mp.Name() == "metrics" {
+					// Use type assertion to access the internal structure
+					// This is safe because we control both plugins
+					if internal, ok := plugin.(interface {
+						GetCollectors() *sync.Map
+					}); ok {
+						p.metricsPlugin = &metricsPluginInternal{
+							collectors: *internal.GetCollectors(),
+						}
+						p.log.Info("metrics plugin collected, JavaScript can now access user metrics")
+					}
+				}
+			}
+		},
 	}
 }
 
