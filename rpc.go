@@ -1,6 +1,7 @@
 package jsmachine
 
 import (
+	"context"
 	"fmt"
 	"time"
 
