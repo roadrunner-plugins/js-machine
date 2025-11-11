@@ -1,0 +1,61 @@
+# RoadRunner Configuration Example with JavaScript Plugin
+
+version: "3"
+
+# RPC configuration for plugin communication
+rpc:
+  listen: tcp://127.0.0.1:6001
+
+# Server configuration
+server:
+  command: "php worker.php"
+  relay: pipes
+
+# HTTP server configuration
+http:
+  address: 0.0.0.0:8080
+  middleware: []
+  pool:
+    num_workers: 4
+    max_jobs: 0
+    allocate_timeout: 60s
+    destroy_timeout: 60s
+
+# Logs configuration
+logs:
+  mode: development
+  level: debug
+  encoding: console
+  output: stdout
+  err_output: stderr
+
+# Metrics configuration (Prometheus)
+metrics:
+  address: 127.0.0.1:2112
+  collect:
+    app_metric: true
+
+# JavaScript execution plugin configuration
+js:
+  # Number of JavaScript VMs in the pool
+  # Recommendation: Set to number of CPU cores for CPU-bound tasks
+  # Default: 4
+  pool_size: 4
+
+  # Maximum memory limit per JavaScript VM in megabytes
+  # Otto VMs typically use ~20MB base memory
+  # Default: 512
+  max_memory_mb: 512
+
+  # Default execution timeout in milliseconds
+  # Individual requests can override this value
+  # Recommendation: Set based on your use case
+  #   - Quick scripts: 1000-5000ms
+  #   - API calls: 5000-10000ms
+  #   - Complex processing: 10000-30000ms
+  # Default: 30000 (30 seconds)
+  default_timeout_ms: 30000
+
+# Optional: Status endpoint for health checks
+# status:
+#   address: 127.0.0.1:2114
