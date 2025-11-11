@@ -2,6 +2,7 @@ package jsmachine
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/robertkrimen/otto"
@@ -156,6 +157,7 @@ func (l *LogBinding) getFields(call otto.FunctionCall) []zap.Field {
 // MetricsBinding provides metrics functions to JavaScript
 type MetricsBinding struct {
 	plugin *Plugin
+	mu     sync.RWMutex
 
 	// User-defined metrics registry
 	userCounters   map[string]*prometheus.CounterVec
@@ -293,7 +295,18 @@ func (m *MetricsBinding) extractLabels(call otto.FunctionCall, argIndex int) pro
 
 // getOrCreateCounter gets or creates a counter metric
 func (m *MetricsBinding) getOrCreateCounter(name string, labels prometheus.Labels) *prometheus.CounterVec {
+	m.mu.RLock()
 	// Check if counter already exists
+	if counter, exists := m.userCounters[name]; exists {
+		m.mu.RUnlock()
+		return counter
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check after acquiring write lock
 	if counter, exists := m.userCounters[name]; exists {
 		return counter
 	}
@@ -314,7 +327,7 @@ func (m *MetricsBinding) getOrCreateCounter(name string, labels prometheus.Label
 		labelNames,
 	)
 
-	// Register with Prometheus
+	// Register with Prometheus - MUST use Register, not via MetricsCollector
 	if err := prometheus.Register(counter); err != nil {
 		// If already registered by another VM, try to get it
 		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
@@ -333,7 +346,18 @@ func (m *MetricsBinding) getOrCreateCounter(name string, labels prometheus.Label
 
 // getOrCreateGauge gets or creates a gauge metric
 func (m *MetricsBinding) getOrCreateGauge(name string, labels prometheus.Labels) *prometheus.GaugeVec {
+	m.mu.RLock()
 	// Check if gauge already exists
+	if gauge, exists := m.userGauges[name]; exists {
+		m.mu.RUnlock()
+		return gauge
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check after acquiring write lock
 	if gauge, exists := m.userGauges[name]; exists {
 		return gauge
 	}
@@ -354,7 +378,7 @@ func (m *MetricsBinding) getOrCreateGauge(name string, labels prometheus.Labels)
 		labelNames,
 	)
 
-	// Register with Prometheus
+	// Register with Prometheus - MUST use Register, not via MetricsCollector
 	if err := prometheus.Register(gauge); err != nil {
 		// If already registered by another VM, try to get it
 		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
@@ -373,7 +397,18 @@ func (m *MetricsBinding) getOrCreateGauge(name string, labels prometheus.Labels)
 
 // getOrCreateHistogram gets or creates a histogram metric
 func (m *MetricsBinding) getOrCreateHistogram(name string, labels prometheus.Labels) *prometheus.HistogramVec {
+	m.mu.RLock()
 	// Check if histogram already exists
+	if histogram, exists := m.userHistograms[name]; exists {
+		m.mu.RUnlock()
+		return histogram
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check after acquiring write lock
 	if histogram, exists := m.userHistograms[name]; exists {
 		return histogram
 	}
@@ -395,7 +430,7 @@ func (m *MetricsBinding) getOrCreateHistogram(name string, labels prometheus.Lab
 		labelNames,
 	)
 
-	// Register with Prometheus
+	// Register with Prometheus - MUST use Register, not via MetricsCollector
 	if err := prometheus.Register(histogram); err != nil {
 		// If already registered by another VM, try to get it
 		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
