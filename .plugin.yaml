@@ -1,0 +1,12 @@
+name: js-machine
+description: 'A simple RoadRunner plugin that executes JavaScript code via RPC.'
+category: core
+dependencies:
+  - logger
+  - rpc
+  - metrics
+owner: butschster
+author:
+  name: Pavel Buchnev
+  email: butschster@gmail.com
+license: MIT
